@@ -10,9 +10,15 @@ import argparse
 import socketserver
 import tempfile
 import random
+import datetime
+import ipaddress
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from functools import partial
-from OpenSSL import crypto
+from cryptography import x509
+from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import serialization
 
 
 class HTTPSServer(HTTPServer):
@@ -63,78 +69,82 @@ def run_server(bind, port, directory, cert_path):
 
 def generate_cert(cert_path, bind_address="localhost"):
     """
-    Use OpenSSL to create a new Cert and Key with proper Subject Alternative Names
+    Use pyca/cryptography to create a new Cert and Key with proper Subject Alternative Names
     for client verification
     """
     import socket
-    
-    # create a key pair
-    k = crypto.PKey()
-    k.generate_key(crypto.TYPE_RSA, 4096)
 
-    # create a self-signed cert
-    cert = crypto.X509()
-    cert.get_subject().C = "US"
-    cert.get_subject().ST = "Python HTTPS Server"
-    cert.get_subject().L = "Local"
-    cert.get_subject().O = "Python HTTPS Server"
-    cert.get_subject().OU = "Development"
-    cert.get_subject().CN = bind_address if bind_address else "localhost"
-    
-    # Use a unique serial number
-    cert.set_serial_number(random.randint(1, 2147483647))
-    cert.gmtime_adj_notBefore(0)
-    # Expire cert after 1 year
-    cert.gmtime_adj_notAfter(365 * 24 * 60 * 60)
-    cert.set_issuer(cert.get_subject())
-    cert.set_pubkey(k)
-    
-    # Add Subject Alternative Names for proper client verification
+    # create the SAN list
     san_list = [
-        "DNS:localhost",
-        "IP:127.0.0.1",
-        "IP:::1",  # IPv6 localhost
+        x509.DNSName("localhost"),
+        x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+        x509.IPAddress(ipaddress.IPv6Address("::1")),
     ]
-    
+
     # Add the bind address if it's different from localhost
     if bind_address and bind_address not in ["localhost", "127.0.0.1", ""]:
         # Check if it's an IPv4 address
         try:
             parts = bind_address.split(".")
             if len(parts) == 4 and all(part.isdigit() and 0 <= int(part) <= 255 for part in parts):
-                san_list.append(f"IP:{bind_address}")
+                san_list.append(x509.IPAddress(ipaddress.IPv4Address(bind_address)))
             else:
-                san_list.append(f"DNS:{bind_address}")
+                san_list.append(x509.DNSName(bind_address))
         except (ValueError, AttributeError):
-            san_list.append(f"DNS:{bind_address}")
-    
+            san_list.append(x509.DNSName(bind_address))
+
     # Try to add the actual hostname
     try:
         hostname = socket.gethostname()
-        if hostname not in ["localhost"] and f"DNS:{hostname}" not in san_list:
-            san_list.append(f"DNS:{hostname}")
+        if hostname not in ["localhost"] and x509.DNSName(hostname) not in san_list:
+            san_list.append(x509.DNSName(hostname))
     except:
         pass
-    
-    # Create the SAN extension
-    san_extension = crypto.X509Extension(
-        b"subjectAltName",
-        False,
-        ",".join(san_list).encode()
-    )
-    
-    # Add extensions
-    cert.add_extensions([
-        san_extension,
-        crypto.X509Extension(b"basicConstraints", True, b"CA:FALSE"),
-        crypto.X509Extension(b"keyUsage", True, b"digitalSignature,keyEncipherment"),
-        crypto.X509Extension(b"extendedKeyUsage", True, b"serverAuth"),
-    ])
-    
-    cert.sign(k, "sha256")
 
-    cert_pem = crypto.dump_certificate(crypto.FILETYPE_PEM, cert).decode()
-    key_pem = crypto.dump_privatekey(crypto.FILETYPE_PEM, k).decode()
+
+    # create a key pair
+    key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
+
+    # create a self-signed cert
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
+        x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, "Python HTTPS Server"),
+        x509.NameAttribute(NameOID.LOCALITY_NAME, "Local"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Python HTTPS Server"),
+        x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "Development"),
+        x509.NameAttribute(NameOID.COMMON_NAME, bind_address if bind_address else "localhost"),
+    ])
+    cert = (
+        x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+            .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365))
+            .add_extension(x509.SubjectAlternativeName(san_list), critical=False)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=True,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ), critical=True)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=True)
+            .sign(key, hashes.SHA256())
+    )
+
+    cert_pem = cert.public_bytes(encoding=serialization.Encoding.PEM).decode()
+    key_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption()
+    ).decode()
 
     # Write to file if needed
     if cert_path is not None:

@@ -12,5 +12,5 @@ setup(name="https.server",
       packages=["https"],
       entry_points={"console_scripts": ["https.server = https.server:main"]},
       include_package_data=True,
-      install_requires=["pyOpenSSL>=19.0.0"],
+      install_requires=["cryptography>=41.0.0"],
       python_requires=">=3.6")
