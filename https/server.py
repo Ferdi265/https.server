@@ -202,7 +202,7 @@ def main():
         default=8443,
         type=int,
         nargs="?",
-        help="Specify alternate port [default: 8000]",
+        help="Specify alternate port [default: 8443]",
     )
     parser.add_argument(
         "--existing-cert",
